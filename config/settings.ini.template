@@ -1,0 +1,23 @@
+; config/settings.ini.template
+; 설정 파일
+;       사용자가 값을 변경해야 되는 옵선(예: 서버 IP, 타임아웃 시간 등)
+;       '고정'된 구조는 코드 레벨(paths.py)에서 관리
+; 사용법
+;   1.  이 파일을 복사하여 `./config/`에 갖다 놓는다
+;   2.  파일 이름을 'settings.ini'로 변경한다
+;   3.  현재 환경에 맞게 값을 변경한다
+;
+;   이유: git 의 추적받는 파일과 실제 개발하면서 계속 바뀔 파일을 분리하기 위함
+
+
+[App]
+; 애플리케이션 기본 설정
+APP_NAME = Quiet Zone Scanner
+VERSION = 1.0.0
+; 로그 레벨에 따라 표시되는 로그를 조절 가능 (개발 중엔 True, 배포 시 False)
+DEBUG = True
+
+
+[Log]
+; 로그 파일 보관 기간
+;   `./utilities/logger.py` 의 LOG_KEEP_DAYS 상수에 저장
