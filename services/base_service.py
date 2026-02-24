@@ -1,6 +1,6 @@
 from typing import Dict, Optional, Tuple
 
-from PyQt6.QtCore import QObject, QThread
+from PySide6.QtCore import QObject, QThread
 
 from core.events.qt_bus import EVENT_BUS
 
@@ -93,7 +93,16 @@ class BaseService(QObject):
         # 2. 워커를 스레드로 이동
         worker.moveToThread(thread)
 
-        # 3. 생명주기 및 정리 '예약'
+        # 3. 워커가 에러를 내면 로그로 남김
+        if hasattr(worker, "worker_error_occurred"):
+            worker.worker_error_occurred.connect(
+                lambda msg: self.log_error(f"워커({worker_id}) 에러 발생: {msg}")
+            )
+            worker.worker_error_occurred.connect(
+                lambda msg: self._cleanup_worker(worker_id=worker_id)
+            )
+
+        # 4. 생명주기 및 정리 '예약'
         # 스레드 시작 시 워커 동작 (호출자가 thread.started.connect(worker.run) 등을 추가로 할 수 있음.
         # 하지만 보통 worker.run이 슬롯이라면 여기서 연결해주는게 편함.
         # **주의**: Worker마다 실행 메서드 이름이 다를 수 있음(run, process, start 등).
@@ -112,7 +121,7 @@ class BaseService(QObject):
                 )
             )
 
-        # 4. 관리목록에 등록
+        # 5. 관리목록에 등록
         if worker_id:
             self._active_workers[worker_id] = (thread, worker)
             self.log_info(f"워커({worker_id}) 설정 완료. 대기 중...")
@@ -164,8 +173,9 @@ class BaseService(QObject):
                     target_thread.wait()  # 완전히 종료될 때까지 대기
                 else:
                     # 정상적인 종료
-                    target_thread.quit()
-                    if not target_thread.wait(1000):  # 1초 대기
+                    target_thread.requestInterruption()
+                    target_thread.quit()  # 이벤트 루프 종료 요청
+                    if not target_thread.wait(1000):    # 1초 대기
                         self.log_warning(f"스레드가 응답하지 않습니다: {worker_id}")
         except RuntimeError:
             self.log_info(f"이미 삭제된 스레드입니다. (Cleanup): {worker_id}")
