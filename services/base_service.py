@@ -17,7 +17,7 @@ class BaseService(QObject):
         self.log_source = self.__class__.__name__
 
         # 비동기 작업용 워커 저장소
-        # Key: worker_id, Value: (QThread, QObject)
+        # 키: worker_id, 값: (QThread, QObject)
         self._active_workers: Dict[str, Tuple[QThread, QObject]] = {}
 
     # ==========================================================
@@ -73,7 +73,7 @@ class BaseService(QObject):
                 if force_interrupt:
                     # [긴급] 기존 작업 강제 종료하고 내가 들어감
                     self.log_warning(
-                        f"긴급 요청: 워커({worker_id})를 강제로 덮어씁니다."
+                        f"긴급 요청: 기존 작업({worker_id})을 중단하고 새 작업을 시작합니다."
                     )
                     # cleanup_worker를 부르면 딕셔너리에서 지우고 스레드도 끈다
                     self._cleanup_worker(worker_id=worker_id)
