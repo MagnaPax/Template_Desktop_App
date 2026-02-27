@@ -7,8 +7,9 @@ from core.events.qt_bus import EVENT_BUS
 
 class BaseService(QObject):
     """
-    비즈니스 로직을 담당하는 Service의 기본 클래스이다.
+    비즈니스 로직 및 Worker 스레드 라이프사이클을 관리하는 Service이다.
     공통적인 설정이나 리소스 관리, 스레드 관리를 수행한다.
+    단일 종료 경로(Single Exit Path)와 Race Condition 방어 로직을 포함한다.
     """
 
     def __init__(self):
@@ -23,25 +24,17 @@ class BaseService(QObject):
     # ==========================================================
     # [외부 접근] 로깅
     # ==========================================================
-
     def log(self, message: str, level: str = "INFO"):
         """EventBus를 통해 로그를 전송한다."""
         EVENT_BUS.log.message.emit(self.log_source, message, level)
 
-    def log_info(self, message: str):
-        self.log(message, "INFO")
-
-    def log_warning(self, message: str):
-        self.log(message, "WARNING")
-
-    def log_error(self, message: str):
-        self.log(message, "ERROR")
-
-    def log_debug(self, message: str):
-        self.log(message, "DEBUG")
+    def log_info(self, message: str): self.log(message, "INFO")
+    def log_warning(self, message: str): self.log(message, "WARNING")
+    def log_error(self, message: str): self.log(message, "ERROR")
+    def log_debug(self, message: str): self.log(message, "DEBUG")
 
     # ==========================================================
-    # [내부 전용] Thread & Worker Management
+    # [내부 전용] Thread Setup
     # ==========================================================
     def _setup_worker_thread(
         self,
@@ -62,128 +55,74 @@ class BaseService(QObject):
                         True:   기존 실행 중인 같은 ID의 작업을 강제 종료(= 뒤따라 들어온 새로운 명령을 수행)
                         False:  기존 실행 중인 같은 ID의 작업을 계속 수행(= 뒤따라 들어온 새로운 명령을 무시)
         Returns:
-            (thread, worker) 튜플. 실행 실패 시(중복 등) None 반환.
+            thread: 백그라운드 작업을 실행할 컨테이너 (실행은 아직 안 된 상태)
+            worker: 비즈니스 로직을 담고 있는 실제 작업자 객체
+            * 실행 실패 시(중복 요청 무시 등) None 반환
         """
-        # 0. 기존 작업 확인 및 처리
+        # 1. 기존 작업(중복 ID) 확인 및 처리
         if worker_id and worker_id in self._active_workers:
             existing_thread, _ = self._active_workers[worker_id]
 
-            # 스레드가 아직 살아있다면?
+            # 같은 ID의 작업이 이미 실행 중이라면?
             if existing_thread.isRunning():
                 if force_interrupt:
-                    # [긴급] 기존 작업 강제 종료하고 내가 들어감
-                    self.log_warning(
-                        f"긴급 요청: 기존 작업({worker_id})을 중단하고 새 작업을 시작합니다."
-                    )
-                    # cleanup_worker를 부르면 딕셔너리에서 지우고 스레드도 끈다
-                    self._cleanup_worker(worker_id=worker_id)
+                    # [긴급] 저리 비켜! 내가 할 거야.
+                    self.log_warning(f"긴급 요청: 기존 작업({worker_id})을 중단하고 새 작업을 시작합니다.")
+                    self.stop_worker(worker_id)
                 else:
-                    # [일반] 자리가 없으므로 포기
-                    self.log_warning(
-                        f"워커({worker_id})가 이미 실행 중입니다. 새로운 요청은 무시됩니다."
-                    )
+                    # [일반] 기존의 작업에게 양보
+                    self.log_warning(f"워커({worker_id})가 이미 실행 중입니다. 새로운 요청은 무시됩니다.")
                     return None
             else:
-                # 죽어있는 스레드라면 정리하고 진행
-                self._cleanup_worker(worker_id=worker_id)
+                # 죽어있는 스레드일 경우 정리를 위해 종료 요청
+                self._finalize_worker_dict(worker_id, existing_thread)
 
-        # 1. 스레드 생성
+        # 2. 스레드 생성, 워커를 스레드로 이동
         thread = QThread()
-
-        # 2. 워커를 스레드로 이동
         worker.moveToThread(thread)
 
-        # 3. 워커가 에러를 내면 로그로 남김
-        if hasattr(worker, "worker_error_occurred"):
-            worker.worker_error_occurred.connect(
-                lambda msg: self.log_error(f"워커({worker_id}) 에러 발생: {msg}")
+        # 3. 종료 시그널 연결
+        # 워커가 무사히 끝나면 스레드 이벤트 루프를 종료한다.
+        if hasattr(worker, "worker_finished"):
+            worker.worker_finished.connect(thread.quit)
+            
+        # 에러가 발생해도 스레드는 종료해야 한다.
+        if hasattr(worker, "worker_failed"):
+            worker.worker_failed.connect(
+                lambda msg: self.log_error(f"[{worker_id}] 워커 실패: {msg}")
             )
-            worker.worker_error_occurred.connect(
-                lambda msg: self._cleanup_worker(worker_id=worker_id)
-            )
+            worker.worker_failed.connect(thread.quit)
 
-        # 4. 생명주기 및 정리 '예약'
-        # 스레드 시작 시 워커 동작 (호출자가 thread.started.connect(worker.run) 등을 추가로 할 수 있음.
-        # 하지만 보통 worker.run이 슬롯이라면 여기서 연결해주는게 편함.
-        # **주의**: Worker마다 실행 메서드 이름이 다를 수 있음(run, process, start 등).
-        # 따라서 여기서는 '실행' 로직은 연결하지 않고, '정리' 로직만 연결함.
-
-        # 워커가 일을 다 마치면(worker_task_finished 시그널) -> 자동 정리
-        if hasattr(worker, "worker_task_finished"):
-            # 워커 종료 -> 스레드 종료 요청 -> 객체 삭제 -> 딕셔너리 정리
-            worker.worker_task_finished.connect(thread.quit)
-            worker.worker_task_finished.connect(worker.deleteLater)
-            thread.finished.connect(thread.deleteLater)
-            # cleanup_worker를 통해 딕셔너리에서도 안전하게 제거
-            worker.worker_task_finished.connect(
-                lambda: self._cleanup_worker(
-                    thread=thread, worker=worker, worker_id=worker_id
-                )
-            )
-
-        # 5. 관리목록에 등록
+        # 4. [단일 종료 경로] 메모리 및 딕셔너리 정리
+        # 스레드가 완전히 끝났을 때만 객체를 메모리에서 지운다. (C++ 충돌 방지)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        
+        # 딕셔너리 정리는 Race Condition 방어를 위해 대상 스레드 객체를 람다로 넘긴다.
         if worker_id:
+            thread.finished.connect(
+                lambda wid=worker_id, t=thread: self._finalize_worker_dict(wid, t)
+            )
             self._active_workers[worker_id] = (thread, worker)
-            self.log_info(f"워커({worker_id}) 설정 완료. 대기 중...")
 
+        self.log_info(f"[{worker_id if worker_id else 'Anonymous'}] 스레드 설정 완료 및 시작.")
         return thread, worker
 
-    def _cleanup_worker(
-        self,
-        thread: QThread = None,
-        worker: QObject = None,
-        worker_id: Optional[str] = None,
-        force: bool = False,
-    ):
+    def _finalize_worker_dict(self, worker_id: str, target_thread: QThread):
         """
-        스레드와 워커를 안전하게 종료하고 정리한다.
+        스레드 종료 시 호출되어 딕셔너리에서 워커를 제거한다. (Race Condition 방어)
         """
-        # 1. 대상 찾기
-        target_thread = thread
-
-        # ID로 조회
-        if worker_id and worker_id in self._active_workers:
-            stored_thread, stored_worker = self._active_workers[worker_id]
-
-            # 파라미터가 없으면 저장된 놈을 타겟으로
-            if target_thread is None:
-                target_thread = stored_thread
-
-            # [Race Condition 방지]
-            # cleanup_worker가 호출된 시점에 이미 같은 ID로 "새로운 작업"이 시작되었을 수 있다.
-            # 이 경우, 딕셔너리에 있는 스레드(새 작업)는 건드리지 않고, 종료 요청된 스레드(target_thread)만 조용히 정리해야 한다.
-            # 만약 여기서 stored_thread를 건드리면, 방금 막 시작된 새 작업이 영문도 모른 채 강제 종료되는 대참사가 벌어진다.
-            if target_thread != stored_thread:
-                self.log_warning(
-                    f"Cleanup 경고: ID({worker_id})의 활성 스레드가 변경되었습니다. 건너뜁니다."
-                )
-                return
-
-        # 2. 스레드 정지
-        # 스레드가 예기치 않게 먼저 죽어있더라도 (deleteLater 등으로 인해)
-        # 앱이 크래시되지 않고 "이미 삭제된 스레드입니다" 로그만 남기고 안전하게 넘어가기 위해 try-except로 감싼다.
-        try:
-            if target_thread and target_thread.isRunning():
-                self.log_info(
-                    f"스레드 종료 요청: {worker_id if worker_id else 'Anonymous'}"
-                )
-                if force:
-                    self.log_warning(f"비상 정지! {worker_id} 스레드 즉시 종료 시도")
-                    target_thread.terminate()  # 강제 종료
-                    target_thread.wait()  # 완전히 종료될 때까지 대기
-                else:
-                    # 정상적인 종료
-                    target_thread.requestInterruption()
-                    target_thread.quit()  # 이벤트 루프 종료 요청
-                    if not target_thread.wait(1000):    # 1초 대기
-                        self.log_warning(f"스레드가 응답하지 않습니다: {worker_id}")
-        except RuntimeError:
-            self.log_info(f"이미 삭제된 스레드입니다. (Cleanup): {worker_id}")
-
-        # 3. 목록에서 제거
-        if worker_id and worker_id in self._active_workers:
-            del self._active_workers[worker_id]
-            self.log_info(f"활성 워커 목록에서 제거됨: {worker_id}")
+        if worker_id in self._active_workers:
+            stored_thread, _ = self._active_workers[worker_id]
+            
+            # [Race Condition 방어]
+            # 강제 종료 등으로 딕셔너리가 이미 새 스레드로 덮어씌워졌다면,
+            # 현재 끝난 스레드(target_thread)는 딕셔너리를 건드리지 않는다.
+            if stored_thread is target_thread:
+                del self._active_workers[worker_id]
+                self.log_debug(f"[{worker_id}] 활성 워커 목록에서 안전하게 제거되었습니다.")
+            else:
+                self.log_debug(f"[{worker_id}] 딕셔너리 활성 스레드가 변경되었습니다. 정리를 건너뜁니다.")
 
     # ==========================================================
     # [외부 접근] 워커 관리
@@ -195,56 +134,81 @@ class BaseService(QObject):
         force_interrupt: bool = False,
     ) -> Optional[QThread]:
         """
-        [편의 메서드] 워커 설정부터 실행까지 한 번에 수행한다.
+        워커 설정 & 실행
         보편적인 워커 패턴 (worker.run 메서드 보유)을 따를 때 유용하다.
 
         Args:
-            worker: 실행할 워커
-            worker_id: 워커 식별자
-            force_interrupt: 강제 실행 여부 (Emergency Stop 등 긴급 동작을 위한 워커 생성 시 사용)
+            worker:         실행할 워커
+            worker_id:      워커 식별자
+            force_interrupt:강제 실행 여부 (Emergency Stop 등 기존 작업을 강제 중단시키고 새 작업으로 대체할 때 사용)
 
         Returns:
-            실행된 스레드 객체 (실패 시 None)
+            thread:         실행된 스레드 객체 (실패 시 None)
         """
         result = self._setup_worker_thread(worker, worker_id, force_interrupt)
-
+        
         # 설정 실패(중복 실행 방지 등) 시 None 반환
         if result is None:
             return None
-
+            
         thread, worker = result
-
-        # 'run' 메서드가 있다면 스레드 시작 시 자동 실행 연결
+        
+        # 'run' 메서드가 있다면 자동 실행 연결
         if hasattr(worker, "run") and callable(getattr(worker, "run")):
             thread.started.connect(worker.run)
         else:
-            self.log_warning(
-                f"워커({worker_id})에 'run' 메서드가 없어 자동 실행되지 않았습니다. 별도 연결이 필요할 수 있습니다."
-            )
+            self.log_warning(f"[{worker_id}] 워커에 'run' 메서드가 없어 자동 연결되지 않았습니다.")
 
         thread.start()
         return thread
 
     def stop_worker(self, worker_id: str):
-        """ID에 해당하는 워커와 스레드를 종료하고 정리한다."""
-        self._cleanup_worker(worker_id=worker_id)
+        """ID에 해당하는 워커와 스레드를 안전하게 중단 요청한다."""
+        if worker_id not in self._active_workers:
+            return
+
+        thread, worker = self._active_workers[worker_id]
+
+        self.log_info(f"[{worker_id}] 종료 요청 중...")
+        
+        # 1. Thread 자체에 협력적 중단 요청 (가장 안전)
+        thread.requestInterruption()
+
+        # 2. Worker 내부 특수 자원 해제 로직 호출
+        if hasattr(worker, "stop_custom_resources"):
+            worker.stop_custom_resources()
+            
+        # 3. 이벤트 루프 종료 요청
+        try:
+            thread.quit()
+        except RuntimeError:
+            self.log_info(f"[{worker_id}] 이미 삭제된 스레드이다.")
+
+        # thread.finished 시그널 발생 시 _finalize_worker_dict가 깔끔하게 정리한다.
 
     def force_stop_worker(self, worker_id: str):
         """
-        ID에 해당하는 워커와 스레드를 강제로 종료하고 정리
-            프로그램 종료, 심각한 에러 발생 후 자동복구 루틴, 비상정지 등에 사용될 수 있다
+        응답이 없을 때 사용하는 비상 정지.
+        메모리 누수나 데드락 위험이 있으므로 최후 수단으로만 사용한다.
         """
-        self._cleanup_worker(worker_id=worker_id, force=True)
+        if worker_id not in self._active_workers:
+            return
+            
+        thread, _ = self._active_workers[worker_id]
+        self.log_warning(f"[{worker_id}] 비상 정지 (terminate) 시도!")
+        
+        try:
+            thread.terminate()
+            thread.wait() # 완전히 죽을 때까지 대기
+        except RuntimeError:
+            pass
 
     def cleanup_all_workers(self):
-        """
-        관리 중인 모든 워커와 스레드를 정리
-        서비스가 종료되거나 리셋될 때 "모든 활성 워커를 싹 정리"하는 메서드
-        """
+        """서비스가 종료되거나 리셋될 때 "모든 활성 워커를 싹 정리"하는 메서드"""
         if not self._active_workers:
             return
 
-        self.log_info(f"모든 활성 워커 정리 시작 ({len(self._active_workers)}개)")
         # 딕셔너리 크기가 변하면 안 되므로 키 복사본으로 순회
+        self.log_info(f"모든 활성 워커({len(self._active_workers)}개) 정리 시작.")
         for worker_id in list(self._active_workers.keys()):
-            self._cleanup_worker(worker_id=worker_id)
+            self.stop_worker(worker_id)
